@@ -905,6 +905,16 @@ class ServiceRegistry:
             settings_params=["voice"],
         ),
         ServiceDefinition(
+            value="kalpa_tts",
+            label="Kalpa",
+            package="pipecat-ai[kalpa]",
+            class_name=["KalpaTTSService"],
+            env_prefix="KALPA",
+            include_params=["api_key"],
+            settings_params=["voice"],
+            param_defaults={"voice": "18c26f49-9f9c-400c-bec9-7467f28e1db5"},
+        ),
+        ServiceDefinition(
             value="kokoro_tts",
             label="Kokoro",
             package="pipecat-ai[kokoro]",
