@@ -39,13 +39,12 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 _DEFAULT_VOICE_ID = "18c26f49-9f9c-400c-bec9-7467f28e1db5"  # Arjun
 _DEFAULT_MODEL = "kalpa-tts-1"
 
-# Rates Kalpa renders directly. Any other pipeline rate is served at 24 kHz, the model's own.
-_SAMPLE_RATES = (8000, 16000, 22050, 24000, 32000, 44100, 48000)
-_DEFAULT_SAMPLE_RATE = 24000
+# The model's own rate. The output transport resamples it to the pipeline's.
+_SAMPLE_RATE = 24000
 
 _SESSION_TIMEOUT_SECONDS = 10.0
 
-# Kalpa closes a connection after 300 seconds without a client message.
+# Kalpa closes an idle connection. An empty `sendText` keeps it open.
 _KEEPALIVE_INTERVAL_SECONDS = 60.0
 
 # Kalpa ends every reply with `responseDone`, so the base class's idle timeout on an
@@ -58,8 +57,9 @@ _CANCEL_ACK_TIMEOUT_SECONDS = 1.0
 # Kalpa's limit on one utterance's text.
 _MAX_UTTERANCE_CHARS = 8000
 
-# How long a flush waits for Kalpa to start the utterance queued before it.
-_FLUSH_WAIT_SECONDS = 30.0
+# Kalpa starts a queued utterance once the one before it has rendered, which takes a few
+# minutes at most. A queue stuck for longer is abandoned.
+_QUEUE_WAIT_SECONDS = 300.0
 
 # Categories of the error types at https://docs.kalpalabs.ai/rate-limits-and-errors that are not
 # the server failing. Rejected text fails only its own request, so it doesn't cost the service
@@ -84,22 +84,14 @@ def _error_category(error_type: str | None, status: int | None = None) -> ErrorC
     return classify_http_status_code(status) if status else ErrorCategory.SERVER
 
 
-def _resolve_sample_rate(sample_rate: int) -> int:
-    """Pick the rate Kalpa will synthesize at.
-
-    Args:
-        sample_rate: The pipeline's output rate.
-
-    Returns:
-        The pipeline's rate when Kalpa renders it, else 24000.
-    """
-    if sample_rate in _SAMPLE_RATES:
-        return sample_rate
-    logger.warning(
-        f"Kalpa cannot render {sample_rate} Hz (supports {list(_SAMPLE_RATES)}); "
-        f"synthesizing at {_DEFAULT_SAMPLE_RATE} Hz and resampling"
-    )
-    return _DEFAULT_SAMPLE_RATE
+def _split(text: str) -> list[str]:
+    """Cut text longer than one utterance takes, at the last space before the limit."""
+    pieces = []
+    while len(text) > _MAX_UTTERANCE_CHARS:
+        cut = text.rfind(" ", 0, _MAX_UTTERANCE_CHARS) + 1 or _MAX_UTTERANCE_CHARS
+        pieces.append(text[:cut])
+        text = text[cut:]
+    return [*pieces, text]
 
 
 @dataclass
@@ -145,6 +137,9 @@ class KalpaTTSService(WebsocketTTSService):
     cancel covers everything the server holds for the connection, including
     uninterruptible speech queued behind the interrupted reply.
 
+    Audio is 24 kHz mono; the output transport resamples it to the pipeline's
+    rate.
+
     Event handlers:
 
     - on_connected: Called when the websocket connection is established.
@@ -163,15 +158,12 @@ class KalpaTTSService(WebsocketTTSService):
 
     Settings = KalpaTTSSettings
     _settings: Settings
-    # The rate Kalpa synthesizes at, resolved in setup() from the pipeline's.
-    _kalpa_sample_rate: int
 
     def __init__(
         self,
         *,
         api_key: str,
         base_url: str = "wss://api.kalpalabs.ai",
-        sample_rate: int | None = None,
         text_aggregation_mode: TextAggregationMode = TextAggregationMode.TOKEN,
         settings: Settings | None = None,
         **kwargs,
@@ -182,9 +174,6 @@ class KalpaTTSService(WebsocketTTSService):
             api_key: Kalpa API key for authentication.
             base_url: WebSocket base URL for the Kalpa API. Defaults to
                 ``wss://api.kalpalabs.ai``.
-            sample_rate: Output sample rate in Hz. If None, uses the pipeline
-                default. A rate Kalpa does not render is replaced with 24000
-                and resampled by the output transport.
             text_aggregation_mode: How to aggregate incoming text before sending.
                 Defaults to ``TextAggregationMode.TOKEN``, streaming LLM tokens
                 straight to Kalpa, which picks its own sentence boundaries.
@@ -195,7 +184,7 @@ class KalpaTTSService(WebsocketTTSService):
             raise ValueError("Kalpa API key is required")
         kwargs.setdefault("stop_frame_timeout_s", _STOP_FRAME_TIMEOUT_SECONDS)
         super().__init__(
-            sample_rate=sample_rate,
+            sample_rate=_SAMPLE_RATE,
             push_start_frame=True,
             push_stop_frames=False,
             # One reply generates at a time, so the next waits for the current one.
@@ -237,7 +226,6 @@ class KalpaTTSService(WebsocketTTSService):
             setup: Configuration object containing setup parameters.
         """
         await super().setup(setup)
-        self._kalpa_sample_rate = _resolve_sample_rate(self.sample_rate)
         await self._connect()
 
     async def _connect(self):
@@ -273,7 +261,18 @@ class KalpaTTSService(WebsocketTTSService):
             except Exception as e:
                 logger.debug(f"{self} failed to close Kalpa websocket: {e}")
             self._websocket = None
+        await self._forget_connection()
         await self._connect()
+
+    async def _forget_connection(self):
+        """Drop what Kalpa held on a connection that is gone, closing contexts that had ended."""
+        context_ids = {u.context_id for u in self._utterances}
+        self._utterances.clear()
+        self._unacked_cancels = 0
+        self._cancels_acked.set()
+        self._utterance_started.set()
+        for context_id in context_ids:
+            await self._close_if_finished(context_id)
 
     async def _connect_websocket(self):
         """Open the socket and hold the session at ``sessionCreated``."""
@@ -295,8 +294,6 @@ class KalpaTTSService(WebsocketTTSService):
                         "model": self._settings.model,
                         # Start a reply's audio at its first complete sentences.
                         "generation_config": {},
-                        "output_format": "pcm_s16le",
-                        "sample_rate": self._kalpa_sample_rate,
                     }
                 )
             )
@@ -316,12 +313,6 @@ class KalpaTTSService(WebsocketTTSService):
                 raise Exception(f"unexpected message before sessionCreated: {message}")
 
             logger.debug(f"{self}: session created (session_id: {message.get('session_id')})")
-            # The rate Kalpa renders at; the output transport resamples any difference.
-            self._kalpa_sample_rate = message["sample_rate"]
-            self._utterances.clear()
-            self._unacked_cancels = 0
-            self._cancels_acked.set()
-            self._utterance_started.set()
             self._websocket = websocket
             await self._call_event_handler("on_connected")
         except BaseException as e:
@@ -347,6 +338,7 @@ class KalpaTTSService(WebsocketTTSService):
             logger.debug(f"{self} failed to close Kalpa websocket: {e}")
         finally:
             self._websocket = None
+            await self._forget_connection()
             await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
@@ -388,11 +380,13 @@ class KalpaTTSService(WebsocketTTSService):
         while any(u.flushed and not u.response_id for u in self._utterances):
             self._utterance_started.clear()
             try:
-                await asyncio.wait_for(self._utterance_started.wait(), _FLUSH_WAIT_SECONDS)
+                await asyncio.wait_for(self._utterance_started.wait(), _QUEUE_WAIT_SECONDS)
             except TimeoutError:
-                break
+                await self.push_error(f"{self} error: Kalpa did not start a queued reply")
+                await self._abandon_replies()
+                return
         if utterance not in self._utterances:
-            return  # cancelled while waiting
+            return  # cancelled or disconnected while waiting
         utterance.flushed = True
         await self._get_websocket().send(json.dumps({"type": "sendText", "flush": True}))
 
@@ -403,6 +397,9 @@ class KalpaTTSService(WebsocketTTSService):
         if any(u.context_id == context_id for u in self._utterances):
             return
         self._ended_context_ids.discard(context_id)
+        await self._close_context(context_id)
+
+    async def _close_context(self, context_id: str):
         if self.audio_context_available(context_id):
             await self.append_to_audio_context(context_id, TTSStoppedFrame(context_id=context_id))
             await self.remove_audio_context(context_id)
@@ -428,9 +425,15 @@ class KalpaTTSService(WebsocketTTSService):
         """Cancel the interrupted reply on the server instead of reconnecting."""
         await self.stop_all_metrics()
         try:
-            await self._cancel_replies()
+            cancelled = await self._cancel_replies()
         except Exception as e:
             logger.error(f"{self} error sending cancelResponse: {e}")
+            cancelled = []
+        # The cancel also drops uninterruptible speech the base class keeps, so close it too.
+        for other_id in cancelled:
+            context = self._tts_contexts.get(other_id)
+            if context and not context.interruptible:
+                await self._close_context(other_id)
         await super().on_audio_context_interrupted(context_id)
 
     async def flush_audio(self, context_id: str | None = None):
@@ -453,12 +456,16 @@ class KalpaTTSService(WebsocketTTSService):
 
     async def _push_kalpa_error(self, message: dict):
         error = message.get("error", {})
-        category = _error_category(error.get("type"))
+        fatal = bool(message.get("fatal"))
+        if fatal and error.get("type") == "invalid_request":
+            category = ErrorCategory.INVALID_REQUEST  # the session itself was rejected
+        else:
+            category = _error_category(error.get("type"))
         await self.push_error(
             error_msg=f"{self} error ({error.get('type')}): {error.get('message')}",
             category=category,
             # The connection is closing. Only a server failure is worth reconnecting for.
-            force_treat_as_permanent=bool(message.get("fatal"))
+            force_treat_as_permanent=fatal
             and category not in (ErrorCategory.SERVER, ErrorCategory.RATE_LIMIT),
         )
 
@@ -470,13 +477,13 @@ class KalpaTTSService(WebsocketTTSService):
 
         if not message.get("fatal") and not message.get("response_id"):
             # Kalpa rejected a message and left everything else as it was, so its utterances
-            # may no longer line up with ours. Drop them all and start over.
-            for context_id in await self._cancel_replies():
-                if self.audio_context_available(context_id):
-                    await self.append_to_audio_context(
-                        context_id, TTSStoppedFrame(context_id=context_id)
-                    )
-                    await self.remove_audio_context(context_id)
+            # may no longer line up with ours.
+            await self._abandon_replies()
+
+    async def _abandon_replies(self):
+        """Cancel everything Kalpa holds and close the contexts it was speaking, to start over."""
+        for context_id in await self._cancel_replies():
+            await self._close_context(context_id)
 
     async def _receive_messages(self):
         async for raw in self._get_websocket():
@@ -505,15 +512,16 @@ class KalpaTTSService(WebsocketTTSService):
                 audio = base64.b64decode(message["pcm_b64"])
                 await self.append_to_audio_context(
                     utterance.context_id,
-                    TTSAudioRawFrame(
-                        audio, self._kalpa_sample_rate, 1, context_id=utterance.context_id
-                    ),
+                    TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=utterance.context_id),
                 )
             elif msg_type == "responseDone" and utterance:
-                # Also ends an utterance that failed before its flush; more text for its
-                # context then starts a new one.
-                self._utterances.remove(utterance)
-                await self._close_if_finished(utterance.context_id)
+                if utterance.flushed:
+                    self._utterances.remove(utterance)
+                    await self._close_if_finished(utterance.context_id)
+                else:
+                    # It failed before its flush. Kalpa keeps taking the utterance's text and
+                    # starts a new response for it.
+                    utterance.response_id = None
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
@@ -539,21 +547,21 @@ class KalpaTTSService(WebsocketTTSService):
             ):
                 await self._reopen()
 
-            utterance = self._open_utterance()
-            if utterance and (
-                utterance.context_id != context_id
-                or utterance.chars + len(text) > _MAX_UTTERANCE_CHARS
-            ):
-                # Kalpa buffers one utterance at a time, so another context's text (a
-                # TTSSpeakFrame mid-reply), or text past an utterance's limit, ends it first.
-                await self._flush(utterance)
-                utterance = None
-            if not utterance:
-                utterance = _Utterance(context_id)
-                self._utterances.append(utterance)
-            utterance.chars += len(text)
-
-            await self._get_websocket().send(json.dumps({"type": "sendText", "text": text}))
+            for piece in _split(text):
+                utterance = self._open_utterance()
+                if utterance and (
+                    utterance.context_id != context_id
+                    or utterance.chars + len(piece) > _MAX_UTTERANCE_CHARS
+                ):
+                    # Kalpa buffers one utterance at a time, so another context's text (a
+                    # TTSSpeakFrame mid-reply), or text past an utterance's limit, ends it first.
+                    await self._flush(utterance)
+                    utterance = None
+                if not utterance:
+                    utterance = _Utterance(context_id)
+                    self._utterances.append(utterance)
+                utterance.chars += len(piece)
+                await self._get_websocket().send(json.dumps({"type": "sendText", "text": piece}))
             await self.start_tts_usage_metrics(text)
 
             # The audio frames will be handled in _receive_messages
@@ -566,22 +574,20 @@ class KalpaHttpTTSService(TTSService):
     """Kalpa HTTP text-to-speech service.
 
     Sends each sentence to ``POST /v1/tts/{voice_id}/stream``, which returns raw
-    PCM as it is generated, and plays the body as it arrives. Voice agents
+    PCM as it is generated, and plays the body as it arrives. Audio is 24 kHz
+    mono; the output transport resamples it to the pipeline's rate. Voice agents
     should prefer :class:`KalpaTTSService`, which streams a whole reply over
     one connection.
     """
 
     Settings = KalpaTTSSettings
     _settings: Settings
-    # The rate Kalpa synthesizes at, resolved in setup() from the pipeline's.
-    _kalpa_sample_rate: int
 
     def __init__(
         self,
         *,
         api_key: str,
         base_url: str = "https://api.kalpalabs.ai",
-        sample_rate: int | None = None,
         aiohttp_session: aiohttp.ClientSession | None = None,
         settings: Settings | None = None,
         **kwargs,
@@ -592,8 +598,6 @@ class KalpaHttpTTSService(TTSService):
             api_key: Kalpa API key for authentication.
             base_url: Base URL for the Kalpa API. Defaults to
                 ``https://api.kalpalabs.ai``.
-            sample_rate: Output sample rate in Hz. If None, uses the pipeline
-                default.
             aiohttp_session: Optional shared aiohttp session. When omitted, the
                 service creates and owns one.
             settings: Runtime-updatable settings.
@@ -602,7 +606,7 @@ class KalpaHttpTTSService(TTSService):
         if not api_key:
             raise ValueError("Kalpa API key is required")
         super().__init__(
-            sample_rate=sample_rate,
+            sample_rate=_SAMPLE_RATE,
             push_start_frame=True,
             push_stop_frames=True,
             settings=_default_settings(settings),
@@ -629,7 +633,6 @@ class KalpaHttpTTSService(TTSService):
             setup: Configuration object containing setup parameters.
         """
         await super().setup(setup)
-        self._kalpa_sample_rate = _resolve_sample_rate(self.sample_rate)
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
             self._session_owner = True
@@ -678,33 +681,27 @@ class KalpaHttpTTSService(TTSService):
             self._session = aiohttp.ClientSession()
             self._session_owner = True
 
-        payload = {
-            "text": text,
-            "model": self._settings.model,
-            "output_format": "pcm_s16le",
-            "sample_rate": self._kalpa_sample_rate,
-        }
-
         try:
-            async with self._session.post(
-                f"{self._base_url}/v1/tts/{self._settings.voice}/stream",
-                json=payload,
-                headers={"Authorization": f"Bearer {self._api_key}"},
-            ) as response:
-                if response.status != 200:
-                    await self._push_http_error(response)
-                    return
+            for piece in _split(text):
+                async with self._session.post(
+                    f"{self._base_url}/v1/tts/{self._settings.voice}/stream",
+                    json={"text": piece, "model": self._settings.model},
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                ) as response:
+                    if response.status != 200:
+                        await self._push_http_error(response)
+                        return
 
-                await self.start_tts_usage_metrics(text)
+                    await self.start_tts_usage_metrics(piece)
 
-                # A body cut off after audio started raises, so it isn't taken for a whole clip.
-                async for frame in self._stream_audio_frames_from_iterator(
-                    response.content.iter_chunked(self.chunk_size),
-                    in_sample_rate=self._kalpa_sample_rate,
-                    context_id=context_id,
-                ):
-                    await self.stop_ttfb_metrics()
-                    yield frame
+                    # A body cut off after audio started raises, so it isn't taken for a
+                    # whole clip.
+                    async for frame in self._stream_audio_frames_from_iterator(
+                        response.content.iter_chunked(self.chunk_size),
+                        context_id=context_id,
+                    ):
+                        await self.stop_ttfb_metrics()
+                        yield frame
         except Exception as e:
             yield ErrorFrame(error=f"{self} error: {e}", exception=e)
 

@@ -29,6 +29,7 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
     TTSUpdateSettingsFrame,
 )
+from pipecat.pipeline.worker import PipelineParams
 from pipecat.services.kalpa.tts import KalpaHttpTTSService, KalpaTTSService
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.utils.errors import ErrorCategory
@@ -75,12 +76,16 @@ class _FakeKalpa:
         *,
         init_error: dict | None = None,
         fail_first: dict | None = None,
+        fail_first_open: dict | None = None,
         render_seconds: float = 0.0,
         hold_first: bool = False,
         ack_cancels: bool = True,
     ):
         self.init_error = init_error  # sent instead of sessionCreated, then the socket closes
         self.fail_first = fail_first  # the first response fails with this error
+        # The first response fails with this error at its utterance's second text, before the
+        # flush; text arriving after that waits for a new response, as on the server.
+        self.fail_first_open = fail_first_open
         self.render_seconds = render_seconds
         self.hold_first = hold_first  # the first response starts only when a cancel arrives
         self.ack_cancels = ack_cancels
@@ -142,9 +147,24 @@ class _FakeKalpa:
                         await send({"type": "error", "fatal": True, "error": self.init_error})
                         await ws.close(4401)
                         return
-                    rate = msg["sample_rate"]
-                    await send({"type": "sessionCreated", "session_id": "s", "sample_rate": rate})
+                    await send({"type": "sessionCreated", "session_id": "s", "sample_rate": 24000})
                 elif msg["type"] == "sendText":
+                    if len(open_text + msg.get("text", "")) > 8000:
+                        error = {"type": "invalid_request", "message": "over 8000 characters"}
+                        await send({"type": "error", "fatal": False, "error": error})
+                        continue
+                    if self.fail_first_open and current and current["rid"] == "resp_1":
+                        if not current["flushed"] and not msg.get("flush"):
+                            error = {"type": "error", "fatal": False, "response_id": "resp_1"}
+                            await send({**error, "error": self.fail_first_open})
+                            await send(
+                                {
+                                    "type": "responseDone",
+                                    "response_id": "resp_1",
+                                    "status": "cancelled",
+                                }
+                            )
+                            current, open_text = None, ""
                     open_text += msg.get("text", "")
                     if not msg.get("flush"):
                         if open_text and not current and not pending:
@@ -190,17 +210,19 @@ async def _audio(ws, rid: str, pcm: bytes):
     await ws.send(json.dumps({"type": "responseAudio", "response_id": rid, "pcm_b64": pcm_b64}))
 
 
-async def _run_ws(fake: _FakeKalpa, frames: list, **kwargs):
+async def _run_ws(fake: _FakeKalpa, frames: list, pipeline_params=None, **kwargs):
     async with serve(fake.handler, "127.0.0.1", 0) as server:
         host, port = next(iter(server.sockets)).getsockname()[:2]
         tts = KalpaTTSService(api_key="test-key", base_url=f"ws://{host}:{port}", **kwargs)
-        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames), timeout=10)
+        down, up = await asyncio.wait_for(
+            run_test(tts, frames_to_send=frames, pipeline_params=pipeline_params), timeout=10
+        )
     return tts, down, up
 
 
 @pytest.mark.asyncio
 async def test_kalpa_tts_streams_a_reply_over_one_utterance():
-    """LLM tokens go out verbatim and the reply's flush returns its audio at the session rate."""
+    """LLM tokens go out verbatim and the reply's audio stays 24 kHz in a 16 kHz pipeline."""
     fake = _FakeKalpa()
     start = time.monotonic()
     _, down, up = await _run_ws(
@@ -212,7 +234,7 @@ async def test_kalpa_tts_streams_a_reply_over_one_utterance():
             LLMFullResponseEndFrame(),
             SleepFrame(sleep=0.3),
         ],
-        sample_rate=16000,
+        pipeline_params=PipelineParams(audio_out_sample_rate=16000),
     )
 
     assert not _errors(down + up)
@@ -221,15 +243,14 @@ async def test_kalpa_tts_streams_a_reply_over_one_utterance():
     assert init["api_key"] == "test-key"
     assert init["model"] == "kalpa-tts-1"
     assert init["generation_config"] == {}
-    assert init["sample_rate"] == 16000
-    assert "params" not in init
+    assert "sample_rate" not in init and "params" not in init
     sends = fake.of_type("sendText")
     assert [m.get("text") for m in sends if not m.get("flush")] == ["Hello", " there."]
     assert sum(1 for m in sends if m.get("flush")) == 1
 
     assert _audio_of(down) == _pcm(1)
     audio = [f for f in down if isinstance(f, TTSAudioRawFrame)]
-    assert all(f.sample_rate == 16000 for f in audio)
+    assert all(f.sample_rate == 24000 for f in audio)
     types = [type(f) for f in down]
     assert types.index(TTSStartedFrame) < types.index(TTSAudioRawFrame)
     assert types.index(TTSStoppedFrame) > types.index(TTSAudioRawFrame)
@@ -261,7 +282,7 @@ async def test_kalpa_tts_interruption_cancels_on_the_same_connection():
 @pytest.mark.asyncio
 async def test_kalpa_tts_unacknowledged_cancel_replaces_the_connection():
     """Without a `cancelled`, the next reply goes out on a new connection."""
-    fake = _FakeKalpa(render_seconds=5, ack_cancels=False)
+    fake = _FakeKalpa(render_seconds=1.5, ack_cancels=False)
     _, down, up = await _run_ws(
         fake,
         [
@@ -270,7 +291,7 @@ async def test_kalpa_tts_unacknowledged_cancel_replaces_the_connection():
             InterruptionFrame(),
             SleepFrame(sleep=0.1),
             *_reply("Sure."),
-            SleepFrame(sleep=6),
+            SleepFrame(sleep=3),
         ],
     )
 
@@ -302,6 +323,75 @@ async def test_kalpa_tts_speech_inside_a_reply_keeps_every_part():
     reply, speech = started
     assert _audio_of(down, reply) == _pcm(1) + _pcm(3)
     assert _audio_of(down, speech) == _pcm(2)
+    # A context plays out before the next one starts, so the speech follows the whole reply.
+    assert _audio_of(down) == _pcm(1) + _pcm(3) + _pcm(2)
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_reply_goes_on_after_a_response_fails_before_its_flush():
+    """The rest of a reply whose first response failed plays in its own context, not the next."""
+    overloaded = {"type": "overloaded", "message": "The model is temporarily overloaded."}
+    fake = _FakeKalpa(fail_first_open=overloaded)
+    _, down, up = await _run_ws(
+        fake,
+        [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("First part of reply A."),
+            SleepFrame(sleep=0.05),
+            LLMTextFrame(" Second part."),
+            SleepFrame(sleep=0.1),
+            LLMFullResponseEndFrame(),
+            SleepFrame(sleep=0.3),
+            *_reply("Reply B."),
+            SleepFrame(sleep=0.3),
+        ],
+    )
+
+    assert [e.category for e in _errors(down + up)] == [ErrorCategory.SERVER]
+    reply_a, reply_b = [f.context_id for f in down if isinstance(f, TTSStartedFrame)]
+    assert _audio_of(down, reply_a) == _pcm(2)
+    assert _audio_of(down, reply_b) == _pcm(3)
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_dropped_uninterruptible_speech_does_not_hold_the_next_reply():
+    """The barge-in's cancel also drops queued uninterruptible speech; its context closes at once."""
+    fake = _FakeKalpa(render_seconds=0.5)
+    speech = TTSSpeakFrame("Please hold.")
+    speech.interruptible = False
+    start = time.monotonic()
+    _, down, up = await _run_ws(
+        fake,
+        [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("First part of the reply."),
+            SleepFrame(sleep=0.05),
+            speech,
+            SleepFrame(sleep=0.1),
+            InterruptionFrame(),
+            *_reply("Sure."),
+            SleepFrame(sleep=1),
+        ],
+    )
+
+    assert len(fake.paths) == 1 and len(fake.of_type("cancelResponse")) == 1
+    reply_b = [f.context_id for f in down if isinstance(f, TTSStartedFrame)][-1]
+    assert _audio_of(down, reply_b)
+    assert time.monotonic() - start < 5
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_text_over_the_utterance_limit_is_split():
+    """Text longer than one utterance takes is spoken as several, cut at a space."""
+    fake = _FakeKalpa()
+    text = "word " * 1700  # 8,500 characters
+    _, down, up = await _run_ws(fake, [TTSSpeakFrame(text), SleepFrame(sleep=0.3)])
+
+    assert not _errors(down + up)
+    sent = [m["text"] for m in fake.of_type("sendText") if not m.get("flush")]
+    assert "".join(sent) == text
+    assert [len(t) for t in sent] == [8000, 500]
+    assert _audio_of(down) == _pcm(1) + _pcm(2)
 
 
 @pytest.mark.asyncio
@@ -325,13 +415,20 @@ async def test_kalpa_tts_pipeline_cancel_closes_the_connection():
 
 
 @pytest.mark.asyncio
-async def test_kalpa_tts_fatal_session_error_makes_the_service_unusable():
+@pytest.mark.parametrize(
+    "error_type,category",
+    [
+        ("allowance_exhausted", ErrorCategory.QUOTA),
+        ("invalid_request", ErrorCategory.INVALID_REQUEST),  # e.g. an unknown model
+    ],
+)
+async def test_kalpa_tts_fatal_session_error_makes_the_service_unusable(error_type, category):
     """A fatal error while the session opens is reported and not retried."""
-    fake = _FakeKalpa(init_error={"type": "allowance_exhausted", "message": "Allowance used up."})
+    fake = _FakeKalpa(init_error={"type": error_type, "message": "Rejected."})
     tts, down, up = await _run_ws(fake, [*_reply("Hello."), SleepFrame(sleep=0.2)])
 
     errors = _errors(down + up)
-    assert errors and errors[0].category == ErrorCategory.QUOTA
+    assert errors and errors[0].category == category
     assert not tts.is_usable
     assert len(fake.paths) == 1
 
@@ -378,7 +475,10 @@ async def _run_http(aiohttp_client, handler, **kwargs):
     app.router.add_post("/v1/tts/{voice_id}/stream", handler)
     client = await aiohttp_client(app)
     tts = KalpaHttpTTSService(
-        api_key="test-key", base_url=str(client.make_url("")).rstrip("/"), **kwargs
+        api_key="test-key",
+        base_url=str(client.make_url("")).rstrip("/"),
+        stop_frame_timeout_s=0.5,
+        **kwargs,
     )
     down, up = await run_test(tts, frames_to_send=[TTSSpeakFrame(text="Hello from Kalpa.")])
     return tts, down, up
@@ -386,7 +486,7 @@ async def _run_http(aiohttp_client, handler, **kwargs):
 
 @pytest.mark.asyncio
 async def test_kalpa_http_tts_streams_the_raw_pcm_body(aiohttp_client):
-    """The sentence is posted with the pipeline's rate and the body plays as it arrives."""
+    """The sentence is posted and the body plays as it arrives."""
     requests = []
 
     async def handler(request):
@@ -398,19 +498,35 @@ async def test_kalpa_http_tts_streams_the_raw_pcm_body(aiohttp_client):
         await response.write_eof()
         return response
 
-    _, down, up = await _run_http(aiohttp_client, handler, sample_rate=8000)
+    _, down, up = await _run_http(aiohttp_client, handler)
 
     assert not _errors(down + up)
     voice_id, headers, body = requests[0]
     assert voice_id == DEFAULT_VOICE_ID
     assert headers["Authorization"] == "Bearer test-key"
-    assert body == {
-        "text": "Hello from Kalpa.",
-        "model": "kalpa-tts-1",
-        "output_format": "pcm_s16le",
-        "sample_rate": 8000,
-    }
+    assert body == {"text": "Hello from Kalpa.", "model": "kalpa-tts-1"}
     assert _audio_of(down) == AUDIO_1 + AUDIO_2
+
+
+@pytest.mark.asyncio
+async def test_kalpa_http_tts_text_over_the_request_limit_is_split(aiohttp_client):
+    """Text longer than one request takes goes out as several requests, cut at a space."""
+    texts = []
+
+    async def handler(request):
+        texts.append((await request.json())["text"])
+        return web.Response(body=AUDIO_1, content_type="audio/pcm")
+
+    app = web.Application()
+    app.router.add_post("/v1/tts/{voice_id}/stream", handler)
+    client = await aiohttp_client(app)
+    tts = KalpaHttpTTSService(api_key="test-key", base_url=str(client.make_url("")).rstrip("/"))
+    down, up = await run_test(tts, frames_to_send=[TTSSpeakFrame(text="word " * 1700)])
+
+    assert not _errors(down + up)
+    assert "".join(texts) == "word " * 1700
+    assert [len(t) for t in texts] == [8000, 500]
+    assert _audio_of(down) == AUDIO_1 + AUDIO_1
 
 
 @pytest.mark.asyncio
@@ -432,7 +548,7 @@ async def test_kalpa_http_tts_errors_are_categorized(
         error = {"type": error_type, "message": "Nope.", "request_id": "req_1"}
         return web.json_response({"error": error}, status=status)
 
-    tts, down, up = await _run_http(aiohttp_client, handler, sample_rate=24000)
+    tts, down, up = await _run_http(aiohttp_client, handler)
 
     errors = _errors(down + up)
     assert errors and errors[0].category == category
