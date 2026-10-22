@@ -66,9 +66,10 @@ def _errors(frames) -> list[ErrorFrame]:
 class _FakeKalpa:
     """An in-process ``WSS /v1/tts/{voice_id}/stream`` with the server's queueing rules.
 
-    One response renders at a time and one flushed utterance may wait behind it; a third
-    flush is rejected. An utterance's response starts with its first text when nothing is
-    rendering, before the flush that ends it. Response n renders as ``_pcm(n)``.
+    One response renders at a time and up to ``max_queued`` flushed utterances wait behind
+    it; a flush past that is rejected. An utterance's response starts with its first text
+    when nothing is rendering, before the flush that ends it. A connection's response n
+    renders as ``_pcm(n)``, in ``chunks`` pieces spread over ``render_seconds``.
     """
 
     def __init__(
@@ -77,29 +78,42 @@ class _FakeKalpa:
         init_error: dict | None = None,
         fail_first: dict | None = None,
         fail_first_open: dict | None = None,
+        fail_open_times: int = 1,
         render_seconds: float = 0.0,
+        chunks: int = 1,
+        max_queued: int = 20,
         hold_first: bool = False,
         ack_cancels: bool = True,
     ):
         self.init_error = init_error  # sent instead of sessionCreated, then the socket closes
-        self.fail_first = fail_first  # the first response fails with this error
-        # The first response fails with this error at its utterance's second text, before the
-        # flush; text arriving after that waits for a new response, as on the server.
+        self.fail_first = fail_first  # the first response fails with this error after its flush
+        # A connection's first response fails with this error at its utterance's second text,
+        # before the flush, on the first `fail_open_times` connections, after rendering
+        # AUDIO_1. As on the server, the error is fatal and the connection closes.
         self.fail_first_open = fail_first_open
+        self.fail_open_times = fail_open_times
         self.render_seconds = render_seconds
+        self.chunks = chunks
+        self.max_queued = max_queued
         self.hold_first = hold_first  # the first response starts only when a cancel arrives
         self.ack_cancels = ack_cancels
         self.paths: list[str] = []
-        self.messages: list[dict] = []
+        self.connections: list[list[dict]] = []  # the messages received, per connection
+
+    @property
+    def messages(self) -> list[dict]:
+        return [m for messages in self.connections for m in messages]
 
     def of_type(self, type: str) -> list[dict]:
         return [m for m in self.messages if m["type"] == type]
 
     async def handler(self, ws):
         self.paths.append(ws.request.path)
+        messages = []
+        self.connections.append(messages)
         count = 0
         current = None  # {"rid", "flushed", "created"}: the response starting or rendering
-        pending = False  # a flushed utterance waits behind `current`
+        queued = 0  # flushed utterances waiting behind `current`
         open_text = ""  # buffered text of the utterance not flushed yet
         render = None
 
@@ -118,22 +132,26 @@ class _FakeKalpa:
                 render = asyncio.create_task(finish())
 
         async def finish():
-            nonlocal current, pending, open_text
+            nonlocal current, queued, open_text
             rid = current["rid"]
-            await asyncio.sleep(self.render_seconds)
             if rid == "resp_1" and self.fail_first:
+                await asyncio.sleep(self.render_seconds)
                 await send(
                     {"type": "error", "fatal": False, "response_id": rid, "error": self.fail_first}
                 )
                 await send({"type": "responseDone", "response_id": rid, "status": "cancelled"})
             else:
-                await _audio(ws, rid, _pcm(int(rid.split("_")[1])))
+                pcm = _pcm(int(rid.split("_")[1]))
+                size = len(pcm) // self.chunks
+                for i in range(self.chunks):
+                    await asyncio.sleep(self.render_seconds / self.chunks)
+                    await _audio(ws, rid, pcm[i * size : (i + 1) * size])
                 await send({"type": "responseDone", "response_id": rid, "status": "completed"})
-            # Like the server, free the slot only after closing the finished response.
+            # Like the server, start the next utterance only after closing the finished one.
             await asyncio.sleep(0.05)
             current = None
-            if pending:
-                pending = False
+            if queued:
+                queued -= 1
                 await start(flushed=True)
             elif open_text:
                 await start(flushed=False)
@@ -141,7 +159,7 @@ class _FakeKalpa:
         try:
             async for raw in ws:
                 msg = json.loads(raw)
-                self.messages.append(msg)
+                messages.append(msg)
                 if msg["type"] == "initializeConnection":
                     if self.init_error:
                         await send({"type": "error", "fatal": True, "error": self.init_error})
@@ -153,21 +171,22 @@ class _FakeKalpa:
                         error = {"type": "invalid_request", "message": "over 8000 characters"}
                         await send({"type": "error", "fatal": False, "error": error})
                         continue
-                    if self.fail_first_open and current and current["rid"] == "resp_1":
-                        if not current["flushed"] and not msg.get("flush"):
-                            error = {"type": "error", "fatal": False, "response_id": "resp_1"}
-                            await send({**error, "error": self.fail_first_open})
-                            await send(
-                                {
-                                    "type": "responseDone",
-                                    "response_id": "resp_1",
-                                    "status": "cancelled",
-                                }
-                            )
-                            current, open_text = None, ""
+                    if (
+                        self.fail_first_open
+                        and len(self.connections) <= self.fail_open_times
+                        and current
+                        and current["rid"] == "resp_1"
+                        and not current["flushed"]
+                        and not msg.get("flush")
+                    ):
+                        await _audio(ws, "resp_1", AUDIO_1)
+                        error = {"type": "error", "fatal": True, "response_id": "resp_1"}
+                        await send({**error, "error": self.fail_first_open})
+                        await ws.close(1011, "utterance failed")
+                        return
                     open_text += msg.get("text", "")
                     if not msg.get("flush"):
-                        if open_text and not current and not pending:
+                        if open_text and not current and not queued:
                             await start(flushed=False)
                     elif current and not current["flushed"]:
                         current["flushed"] = True  # the open utterance's own response
@@ -177,10 +196,10 @@ class _FakeKalpa:
                     elif not current:
                         open_text = ""
                         await start(flushed=True)
-                    elif not pending:
-                        open_text, pending = "", True
+                    elif queued < self.max_queued:
+                        open_text, queued = "", queued + 1
                     else:
-                        error = {"type": "invalid_request", "message": "already queued"}
+                        error = {"type": "invalid_request", "message": "queue full"}
                         await send({"type": "error", "fatal": False, "error": error})
                 elif msg["type"] == "cancelResponse":
                     # Let the client's next reply reach the socket first.
@@ -195,7 +214,7 @@ class _FakeKalpa:
                         await send(
                             {"type": "responseDone", "response_id": rid, "status": "cancelled"}
                         )
-                    current, pending, open_text = None, False, ""
+                    current, queued, open_text = None, 0, ""
                     if self.ack_cancels:
                         await send({"type": "cancelled"})
         except websockets.ConnectionClosed:
@@ -301,8 +320,12 @@ async def test_kalpa_tts_unacknowledged_cancel_replaces_the_connection():
 
 @pytest.mark.asyncio
 async def test_kalpa_tts_speech_inside_a_reply_keeps_every_part():
-    """A TTSSpeakFrame mid-reply splits the reply in two on the server; all three parts play."""
-    fake = _FakeKalpa(render_seconds=0.3)
+    """Speech inserted mid-reply reaches Kalpa after the reply, in the order it all plays.
+
+    Rendered first, the speech would leave the playing reply without audio for longer than its
+    context's timeout, and the rest of the reply would be lost.
+    """
+    fake = _FakeKalpa(render_seconds=0.8, chunks=8)
     _, down, up = await _run_ws(
         fake,
         [
@@ -310,36 +333,73 @@ async def test_kalpa_tts_speech_inside_a_reply_keeps_every_part():
             LLMTextFrame("First part of the reply."),
             SleepFrame(sleep=0.05),
             TTSSpeakFrame("One moment."),
+            TTSSpeakFrame("Still checking."),
             LLMTextFrame(" And the rest."),
             LLMFullResponseEndFrame(),
-            SleepFrame(sleep=1.5),
+            SleepFrame(sleep=3.5),
         ],
+        stop_frame_timeout_s=0.5,
     )
 
     assert not _errors(down + up)
+    sends = ["flush" if m.get("flush") else m["text"] for m in fake.of_type("sendText")]
+    assert sends == [
+        "First part of the reply.",
+        " And the rest.",
+        "flush",
+        "One moment.",
+        "flush",
+        "Still checking.",
+        "flush",
+    ]
     started = [f.context_id for f in down if isinstance(f, TTSStartedFrame)]
     stopped = [f.context_id for f in down if isinstance(f, TTSStoppedFrame)]
-    assert len(started) == 2 and stopped == started
-    reply, speech = started
-    assert _audio_of(down, reply) == _pcm(1) + _pcm(3)
-    assert _audio_of(down, speech) == _pcm(2)
-    # A context plays out before the next one starts, so the speech follows the whole reply.
-    assert _audio_of(down) == _pcm(1) + _pcm(3) + _pcm(2)
+    assert len(started) == 3 and stopped == started
+    assert [_audio_of(down, context_id) for context_id in started] == [_pcm(1), _pcm(2), _pcm(3)]
 
 
 @pytest.mark.asyncio
-async def test_kalpa_tts_reply_goes_on_after_a_response_fails_before_its_flush():
-    """The rest of a reply whose first response failed plays in its own context, not the next."""
-    overloaded = {"type": "overloaded", "message": "The model is temporarily overloaded."}
-    fake = _FakeKalpa(fail_first_open=overloaded)
-    _, down, up = await _run_ws(
+@pytest.mark.parametrize(
+    "error_type,category,rest,resent,audio",
+    [
+        # The rest of the reply goes out on the new connection, in a context of its own.
+        (
+            "overloaded",
+            ErrorCategory.SERVER,
+            [SleepFrame(sleep=0.2), LLMTextFrame(" Third part.")],
+            [" Third part.", None, "Reply B.", None],
+            [AUDIO_1, b"", _pcm(1), _pcm(2)],
+        ),
+        # The reply's flush is already on its way when the failure arrives.
+        (
+            "context_length_exceeded",
+            ErrorCategory.APPLICATION,
+            [],
+            ["Reply B.", None],
+            [AUDIO_1, b"", _pcm(1)],
+        ),
+    ],
+    ids=["rest-of-reply", "flush-in-flight"],
+)
+async def test_kalpa_tts_reply_that_fails_before_its_flush_replaces_the_connection(
+    error_type, category, rest, resent, audio
+):
+    """Kalpa ends the connection on a reply that fails before its flush.
+
+    What it rendered still plays, the text after the failure goes out on a new connection, and
+    every context gets only its own audio. Speech held behind the reply closes with the
+    connection, without audio, and isn't sent.
+    """
+    fake = _FakeKalpa(fail_first_open={"type": error_type, "message": "Failed."})
+    tts, down, up = await _run_ws(
         fake,
         [
             LLMFullResponseStartFrame(),
             LLMTextFrame("First part of reply A."),
             SleepFrame(sleep=0.05),
-            LLMTextFrame(" Second part."),
-            SleepFrame(sleep=0.1),
+            TTSSpeakFrame("One moment."),
+            LLMTextFrame(" Second part."),  # Kalpa fails the reply here
+            *rest,
             LLMFullResponseEndFrame(),
             SleepFrame(sleep=0.3),
             *_reply("Reply B."),
@@ -347,15 +407,66 @@ async def test_kalpa_tts_reply_goes_on_after_a_response_fails_before_its_flush()
         ],
     )
 
-    assert [e.category for e in _errors(down + up)] == [ErrorCategory.SERVER]
-    reply_a, reply_b = [f.context_id for f in down if isinstance(f, TTSStartedFrame)]
-    assert _audio_of(down, reply_a) == _pcm(2)
-    assert _audio_of(down, reply_b) == _pcm(3)
+    # The held speech's context closes without audio, which the base class also reports.
+    assert [e.category for e in _errors(down + up)][0] == category
+    assert tts.is_usable and len(fake.connections) == 2
+    assert [m.get("text") for m in fake.connections[1] if m["type"] == "sendText"] == resent
+    started = [f.context_id for f in down if isinstance(f, TTSStartedFrame)]
+    assert [_audio_of(down, context_id) for context_id in started] == audio
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_reply_that_goes_quiet_does_not_hold_the_next():
+    """A reply whose context times out before it ends is ended by the next reply's text.
+
+    The base class doesn't end a context that is no longer playing, so the reply's utterance
+    would otherwise stay open and hold every later reply's text.
+    """
+    fake = _FakeKalpa()
+    _, down, up = await _run_ws(
+        fake,
+        [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Let me check."),
+            SleepFrame(sleep=1),  # past the context's timeout
+            LLMFullResponseEndFrame(),
+            SleepFrame(sleep=0.2),
+            *_reply("Reply B."),
+            SleepFrame(sleep=0.5),
+            *_reply("Reply C."),
+            SleepFrame(sleep=0.5),
+        ],
+        stop_frame_timeout_s=0.5,
+    )
+
+    reply_b, reply_c = [f.context_id for f in down if isinstance(f, TTSStartedFrame)][1:]
+    assert _audio_of(down, reply_b) == _pcm(2)
+    assert _audio_of(down, reply_c) == _pcm(3)
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_failed_replies_do_not_count_as_failing_connections():
+    """Kalpa closing the connection on failed replies doesn't make the service give up on it."""
+    overloaded = {"type": "overloaded", "message": "The model is temporarily overloaded."}
+    fake = _FakeKalpa(fail_first_open=overloaded, fail_open_times=3)
+    failing = [
+        LLMFullResponseStartFrame(),
+        LLMTextFrame("First part."),
+        SleepFrame(sleep=0.05),
+        LLMTextFrame(" Second part."),
+        LLMFullResponseEndFrame(),
+        SleepFrame(sleep=0.2),
+    ]
+    tts, down, up = await _run_ws(fake, [*failing * 3, *_reply("Hello."), SleepFrame(sleep=0.3)])
+
+    assert [e.category for e in _errors(down + up)] == [ErrorCategory.SERVER] * 3
+    assert tts.is_usable and len(fake.connections) == 4
+    assert _audio_of(down) == AUDIO_1 * 3 + _pcm(1)
 
 
 @pytest.mark.asyncio
 async def test_kalpa_tts_dropped_uninterruptible_speech_does_not_hold_the_next_reply():
-    """The barge-in's cancel also drops queued uninterruptible speech; its context closes at once."""
+    """The barge-in also drops uninterruptible speech queued behind the reply; its context closes at once."""
     fake = _FakeKalpa(render_seconds=0.5)
     speech = TTSSpeakFrame("Please hold.")
     speech.interruptible = False
@@ -375,23 +486,28 @@ async def test_kalpa_tts_dropped_uninterruptible_speech_does_not_hold_the_next_r
     )
 
     assert len(fake.paths) == 1 and len(fake.of_type("cancelResponse")) == 1
+    assert "Please hold." not in [m.get("text") for m in fake.of_type("sendText")]
     reply_b = [f.context_id for f in down if isinstance(f, TTSStartedFrame)][-1]
     assert _audio_of(down, reply_b)
     assert time.monotonic() - start < 5
 
 
 @pytest.mark.asyncio
-async def test_kalpa_tts_text_over_the_utterance_limit_is_split():
-    """Text longer than one utterance takes is spoken as several, cut at a space."""
-    fake = _FakeKalpa()
-    text = "word " * 1700  # 8,500 characters
-    _, down, up = await _run_ws(fake, [TTSSpeakFrame(text), SleepFrame(sleep=0.3)])
+async def test_kalpa_tts_text_over_the_utterance_limit_is_split(monkeypatch):
+    """Text longer than one utterance takes is spoken as several, cut at a space.
+
+    Each flush waits for room in Kalpa's queue, here one utterance deep.
+    """
+    monkeypatch.setattr("pipecat.services.kalpa.tts._MAX_QUEUED_FLUSHES", 1)
+    fake = _FakeKalpa(render_seconds=0.2, max_queued=1)
+    text = "word " * 3300  # 16,500 characters
+    _, down, up = await _run_ws(fake, [TTSSpeakFrame(text), SleepFrame(sleep=1)])
 
     assert not _errors(down + up)
     sent = [m["text"] for m in fake.of_type("sendText") if not m.get("flush")]
     assert "".join(sent) == text
-    assert [len(t) for t in sent] == [8000, 500]
-    assert _audio_of(down) == _pcm(1) + _pcm(2)
+    assert [len(t) for t in sent] == [8000, 8000, 500]
+    assert _audio_of(down) == _pcm(1) + _pcm(2) + _pcm(3)
 
 
 @pytest.mark.asyncio

@@ -57,8 +57,10 @@ _CANCEL_ACK_TIMEOUT_SECONDS = 1.0
 # Kalpa's limit on one utterance's text.
 _MAX_UTTERANCE_CHARS = 8000
 
-# Kalpa starts a queued utterance once the one before it has rendered, which takes a few
-# minutes at most. A queue stuck for longer is abandoned.
+# Kalpa queues up to 20 ended utterances behind the one it is speaking and rejects a flush past
+# that. A queued utterance starts once the one before it has rendered, which takes a few minutes
+# at most; a queue stuck for longer is abandoned.
+_MAX_QUEUED_FLUSHES = 20
 _QUEUE_WAIT_SECONDS = 300.0
 
 # Categories of the error types at https://docs.kalpalabs.ai/rate-limits-and-errors that are not
@@ -120,6 +122,9 @@ class _Utterance:
     flushed: bool = False
     # Named by `responseCreated`, which Kalpa sends for utterances in the order they arrived.
     response_id: str | None = None
+    # Its context finished playing while the utterance could still take text, so the base class
+    # won't end it.
+    orphaned: bool = False
 
 
 class KalpaTTSService(WebsocketTTSService):
@@ -131,11 +136,18 @@ class KalpaTTSService(WebsocketTTSService):
     sentence, and ends it on the reply's flush. LLM tokens are therefore
     forwarded as they arrive by default; pass
     ``text_aggregation_mode=TextAggregationMode.SENTENCE`` to aggregate
-    sentences before sending instead.
+    sentences before sending instead. Speech that arrives in the middle of a
+    reply, such as a ``TTSSpeakFrame``, plays after the reply, so it is sent
+    once the reply ends.
 
     Interruptions cancel the reply on the server and keep the connection. The
-    cancel covers everything the server holds for the connection, including
-    uninterruptible speech queued behind the interrupted reply.
+    cancel also drops the speech queued behind the interrupted reply,
+    uninterruptible speech included.
+
+    Kalpa closes the connection when a reply fails before it ends, dropping the
+    text it hadn't spoken. As with any replaced connection, audio already
+    received still plays, and text that comes after goes out on a new
+    connection.
 
     Audio is 24 kHz mono; the output transport resamples it to the pipeline's
     rate.
@@ -205,6 +217,8 @@ class KalpaTTSService(WebsocketTTSService):
         self._utterances: list[_Utterance] = []
         # Contexts the base class will send no more text for; each closes with its last utterance.
         self._ended_context_ids: set[str] = set()
+        # Text of contexts that play after the open utterance's, held until it ends.
+        self._held: dict[str, list[str]] = {}
         # Until a cancel is acknowledged, everything received belongs to cancelled work, so a
         # new utterance waits for the acknowledgement.
         self._unacked_cancels = 0
@@ -263,6 +277,12 @@ class KalpaTTSService(WebsocketTTSService):
             self._websocket = None
         await self._forget_connection()
         await self._connect()
+
+    async def _close_connection_contexts(self):
+        # Every context closes with the connection, so text held for them can't play.
+        self._ended_context_ids.difference_update(self._held)
+        self._held.clear()
+        await super()._close_connection_contexts()
 
     async def _forget_connection(self):
         """Drop what Kalpa held on a connection that is gone, closing contexts that had ended."""
@@ -373,11 +393,48 @@ class KalpaTTSService(WebsocketTTSService):
             return self._utterances[-1]
         return None
 
+    async def _ensure_connection(self):
+        """Wait for Kalpa to acknowledge cancels, replacing a connection that can't be used."""
+        if self._unacked_cancels:
+            try:
+                await asyncio.wait_for(self._cancels_acked.wait(), _CANCEL_ACK_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning(f"{self}: Kalpa did not acknowledge a cancel; reconnecting")
+        if self._unacked_cancels or not self._websocket or self._websocket.state is not State.OPEN:
+            await self._reopen()
+
+    async def _send(self, text: str, context_id: str):
+        """Append text to the context's utterance, starting one where needed."""
+        await self._ensure_connection()
+        for piece in _split(text):
+            utterance = self._open_utterance()
+            if utterance and utterance.chars + len(piece) > _MAX_UTTERANCE_CHARS:
+                await self._flush(utterance)
+                utterance = None
+            if not utterance:
+                utterance = _Utterance(context_id)
+                self._utterances.append(utterance)
+            utterance.chars += len(piece)
+            await self._get_websocket().send(json.dumps({"type": "sendText", "text": piece}))
+
+    async def _send_held(self):
+        """Send held text in order, until a context that hasn't ended holds back the rest."""
+        utterance = self._open_utterance()
+        if utterance and utterance.orphaned:
+            await self._flush(utterance)
+        while self._held and not self._open_utterance():
+            context_id = next(iter(self._held))
+            for text in self._held.pop(context_id):
+                await self._send(text, context_id)
+            utterance = self._open_utterance()
+            if utterance and context_id in self._ended_context_ids:
+                await self._flush(utterance)
+
     async def _flush(self, utterance: _Utterance):
         """End the utterance, so Kalpa speaks the rest of its text."""
-        # Kalpa holds one flushed utterance until it can start it, and rejects a flush while
-        # one waits. Its `responseCreated` shows it has started.
-        while any(u.flushed and not u.response_id for u in self._utterances):
+        # Kalpa rejects a flush while its queue is full. A queued utterance's `responseCreated`
+        # shows it has left the queue.
+        while sum(u.flushed and not u.response_id for u in self._utterances) >= _MAX_QUEUED_FLUSHES:
             self._utterance_started.clear()
             try:
                 await asyncio.wait_for(self._utterance_started.wait(), _QUEUE_WAIT_SECONDS)
@@ -392,7 +449,7 @@ class KalpaTTSService(WebsocketTTSService):
 
     async def _close_if_finished(self, context_id: str):
         """Close a context once the base class has ended it and its last utterance is done."""
-        if context_id not in self._ended_context_ids:
+        if context_id not in self._ended_context_ids or context_id in self._held:
             return
         if any(u.context_id == context_id for u in self._utterances):
             return
@@ -405,36 +462,48 @@ class KalpaTTSService(WebsocketTTSService):
             await self.remove_audio_context(context_id)
 
     async def _cancel_replies(self) -> list[str]:
-        """Drop everything Kalpa holds for this connection: buffered text, queued and generating replies.
+        """Drop held text and Kalpa's buffered text, queued and generating replies.
 
         Returns:
             The contexts that were cancelled.
         """
-        context_ids = [u.context_id for u in self._utterances]
-        if not context_ids:
-            return []
-        self._utterances.clear()
+        context_ids = [*{u.context_id for u in self._utterances}, *self._held]
+        self._held.clear()
         self._ended_context_ids.difference_update(context_ids)
+        if not self._utterances:
+            return context_ids
+        self._utterances.clear()
         self._utterance_started.set()
         self._unacked_cancels += 1
         self._cancels_acked.clear()
-        await self._get_websocket().send(json.dumps({"type": "cancelResponse"}))
+        try:
+            await self._get_websocket().send(json.dumps({"type": "cancelResponse"}))
+        except Exception as e:
+            # The unacknowledged cancel replaces the connection before the next reply.
+            logger.error(f"{self} error sending cancelResponse: {e}")
         return context_ids
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Cancel the interrupted reply on the server instead of reconnecting."""
         await self.stop_all_metrics()
-        try:
-            cancelled = await self._cancel_replies()
-        except Exception as e:
-            logger.error(f"{self} error sending cancelResponse: {e}")
-            cancelled = []
+        cancelled = await self._cancel_replies()
         # The cancel also drops uninterruptible speech the base class keeps, so close it too.
         for other_id in cancelled:
             context = self._tts_contexts.get(other_id)
             if context and not context.interruptible:
                 await self._close_context(other_id)
         await super().on_audio_context_interrupted(context_id)
+
+    async def on_audio_context_completed(self, context_id: str):
+        """Mark an utterance whose context went quiet past the stop frame timeout.
+
+        The next text or flush ends it, so speech held behind it isn't held for good. It isn't
+        flushed here: this runs beside the task sending text, whose order the flush must keep.
+        """
+        utterance = self._open_utterance()
+        if utterance and utterance.context_id == context_id:
+            utterance.orphaned = True
+        await super().on_audio_context_completed(context_id)
 
     async def flush_audio(self, context_id: str | None = None):
         """End the reply so Kalpa speaks the rest of its text.
@@ -450,14 +519,17 @@ class KalpaTTSService(WebsocketTTSService):
         try:
             if utterance and utterance.context_id == context_id:
                 await self._flush(utterance)
+            await self._send_held()
         except Exception as e:
             logger.error(f"{self} error sending flush: {e}")
         await self._close_if_finished(context_id)
 
     async def _push_kalpa_error(self, message: dict):
         error = message.get("error", {})
-        fatal = bool(message.get("fatal"))
-        if fatal and error.get("type") == "invalid_request":
+        # A fatal error closes the connection. One that names a response failed that reply, which
+        # a new connection recovers from; one that names none rejected the session.
+        session_failed = bool(message.get("fatal")) and not message.get("response_id")
+        if session_failed and error.get("type") == "invalid_request":
             category = ErrorCategory.INVALID_REQUEST  # the session itself was rejected
         else:
             category = _error_category(error.get("type"))
@@ -465,17 +537,23 @@ class KalpaTTSService(WebsocketTTSService):
             error_msg=f"{self} error ({error.get('type')}): {error.get('message')}",
             category=category,
             # The connection is closing. Only a server failure is worth reconnecting for.
-            force_treat_as_permanent=fatal
+            force_treat_as_permanent=session_failed
             and category not in (ErrorCategory.SERVER, ErrorCategory.RATE_LIMIT),
         )
 
     async def _handle_error(self, message: dict):
-        if message.get("response_id") and not message.get("fatal") and self._unacked_cancels:
+        fatal = bool(message.get("fatal"))
+        if message.get("response_id") and not fatal and self._unacked_cancels:
             return  # the failure of a cancelled reply
+
+        if fatal and message.get("response_id"):
+            # A reply failed before its flush, and Kalpa is closing the connection. That is no
+            # sign of a failing connection, so it doesn't count toward giving up on reconnecting.
+            self._quick_failure_tracker.reset()
 
         await self._push_kalpa_error(message)
 
-        if not message.get("fatal") and not message.get("response_id"):
+        if not fatal and not message.get("response_id"):
             # Kalpa rejected a message and left everything else as it was, so its utterances
             # may no longer line up with ours.
             await self._abandon_replies()
@@ -515,13 +593,8 @@ class KalpaTTSService(WebsocketTTSService):
                     TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=utterance.context_id),
                 )
             elif msg_type == "responseDone" and utterance:
-                if utterance.flushed:
-                    self._utterances.remove(utterance)
-                    await self._close_if_finished(utterance.context_id)
-                else:
-                    # It failed before its flush. Kalpa keeps taking the utterance's text and
-                    # starts a new response for it.
-                    utterance.response_id = None
+                self._utterances.remove(utterance)
+                await self._close_if_finished(utterance.context_id)
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
@@ -535,33 +608,14 @@ class KalpaTTSService(WebsocketTTSService):
             Frame: Nothing directly; audio arrives on the receive task.
         """
         try:
-            if self._unacked_cancels:
-                try:
-                    await asyncio.wait_for(self._cancels_acked.wait(), _CANCEL_ACK_TIMEOUT_SECONDS)
-                except TimeoutError:
-                    logger.warning(f"{self}: Kalpa did not acknowledge a cancel; reconnecting")
-            if (
-                self._unacked_cancels
-                or not self._websocket
-                or self._websocket.state is State.CLOSED
-            ):
-                await self._reopen()
-
-            for piece in _split(text):
-                utterance = self._open_utterance()
-                if utterance and (
-                    utterance.context_id != context_id
-                    or utterance.chars + len(piece) > _MAX_UTTERANCE_CHARS
-                ):
-                    # Kalpa buffers one utterance at a time, so another context's text (a
-                    # TTSSpeakFrame mid-reply), or text past an utterance's limit, ends it first.
-                    await self._flush(utterance)
-                    utterance = None
-                if not utterance:
-                    utterance = _Utterance(context_id)
-                    self._utterances.append(utterance)
-                utterance.chars += len(piece)
-                await self._get_websocket().send(json.dumps({"type": "sendText", "text": piece}))
+            await self._send_held()
+            utterance = self._open_utterance()
+            if utterance and utterance.context_id != context_id:
+                # Another context's speech plays after this utterance's, so Kalpa gets it after
+                # this utterance ends and renders it in the order it plays.
+                self._held.setdefault(context_id, []).append(text)
+            else:
+                await self._send(text, context_id)
             await self.start_tts_usage_metrics(text)
 
             # The audio frames will be handled in _receive_messages
