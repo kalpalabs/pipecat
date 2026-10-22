@@ -477,6 +477,14 @@ SERVICE_CONFIGS = {
         "        ),\n"
         "    )\n"
     ),
+    "kalpa_tts": (
+        "KalpaTTSService(\n"
+        '        api_key=os.getenv("KALPA_API_KEY"),\n'
+        "        settings=KalpaTTSService.Settings(\n"
+        '            voice=os.getenv("KALPA_VOICE_ID", "18c26f49-9f9c-400c-bec9-7467f28e1db5"),\n'
+        "        ),\n"
+        "    )\n"
+    ),
     "kokoro_tts": (
         "KokoroTTSService(\n"
         "        settings=KokoroTTSService.Settings(\n"

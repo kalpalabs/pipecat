@@ -96,6 +96,10 @@ suite:
     scenarios: [scripted/capital_question]
   - bot: voice/voice-inworld-http.py
     scenarios: [scripted/capital_question]
+  - bot: voice/voice-kalpa.py
+    scenarios: [scripted/capital_question, scripted/interruption]
+  - bot: voice/voice-kalpa-http.py
+    scenarios: [scripted/capital_question]
   - bot: voice/voice-kokoro.py
     scenarios: [scripted/capital_question]
   - bot: voice/voice-krisp-viva.py
