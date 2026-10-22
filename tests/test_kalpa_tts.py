@@ -362,21 +362,22 @@ async def test_kalpa_tts_speech_inside_a_reply_keeps_every_part():
 @pytest.mark.parametrize(
     "error_type,category,rest,resent,audio",
     [
-        # The rest of the reply goes out on the new connection, in a context of its own.
+        # The held speech and the rest of the reply go out on the new connection.
         (
             "overloaded",
             ErrorCategory.SERVER,
             [SleepFrame(sleep=0.2), LLMTextFrame(" Third part.")],
-            [" Third part.", None, "Reply B.", None],
-            [AUDIO_1, b"", _pcm(1), _pcm(2)],
+            ["One moment.", None, " Third part.", None, "Reply B.", None],
+            [AUDIO_1, _pcm(1), _pcm(2), _pcm(3)],
         ),
-        # The reply's flush is already on its way when the failure arrives.
+        # The reply's flush, and the speech it releases, are on their way when the failure
+        # arrives; Kalpa drops them, so the speech goes out again on the new connection.
         (
             "context_length_exceeded",
             ErrorCategory.APPLICATION,
             [],
-            ["Reply B.", None],
-            [AUDIO_1, b"", _pcm(1)],
+            ["One moment.", None, "Reply B.", None],
+            [AUDIO_1, _pcm(1), _pcm(2)],
         ),
     ],
     ids=["rest-of-reply", "flush-in-flight"],
@@ -386,9 +387,8 @@ async def test_kalpa_tts_reply_that_fails_before_its_flush_replaces_the_connecti
 ):
     """Kalpa ends the connection on a reply that fails before its flush.
 
-    What it rendered still plays, the text after the failure goes out on a new connection, and
-    every context gets only its own audio. Speech held behind the reply closes with the
-    connection, without audio, and isn't sent.
+    What it rendered still plays, speech held behind it and the text after the failure go out
+    on a new connection, and every context gets only its own audio.
     """
     fake = _FakeKalpa(fail_first_open={"type": error_type, "message": "Failed."})
     tts, down, up = await _run_ws(
@@ -407,8 +407,7 @@ async def test_kalpa_tts_reply_that_fails_before_its_flush_replaces_the_connecti
         ],
     )
 
-    # The held speech's context closes without audio, which the base class also reports.
-    assert [e.category for e in _errors(down + up)][0] == category
+    assert [e.category for e in _errors(down + up)] == [category]
     assert tts.is_usable and len(fake.connections) == 2
     assert [m.get("text") for m in fake.connections[1] if m["type"] == "sendText"] == resent
     started = [f.context_id for f in down if isinstance(f, TTSStartedFrame)]
@@ -416,11 +415,11 @@ async def test_kalpa_tts_reply_that_fails_before_its_flush_replaces_the_connecti
 
 
 @pytest.mark.asyncio
-async def test_kalpa_tts_reply_that_goes_quiet_does_not_hold_the_next():
-    """A reply whose context times out before it ends is ended by the next reply's text.
+async def test_kalpa_tts_reply_that_goes_quiet_does_not_hold_later_speech():
+    """A reply whose context times out before the reply ends is ended then.
 
     The base class doesn't end a context that is no longer playing, so the reply's utterance
-    would otherwise stay open and hold every later reply's text.
+    would otherwise stay open and hold the speech behind it, and every later reply.
     """
     fake = _FakeKalpa()
     _, down, up = await _run_ws(
@@ -428,20 +427,24 @@ async def test_kalpa_tts_reply_that_goes_quiet_does_not_hold_the_next():
         [
             LLMFullResponseStartFrame(),
             LLMTextFrame("Let me check."),
-            SleepFrame(sleep=1),  # past the context's timeout
+            SleepFrame(sleep=0.05),
+            TTSSpeakFrame("One moment."),
+            SleepFrame(sleep=1),  # past the reply context's timeout
             LLMFullResponseEndFrame(),
-            SleepFrame(sleep=0.2),
+            SleepFrame(sleep=0.3),
             *_reply("Reply B."),
-            SleepFrame(sleep=0.5),
-            *_reply("Reply C."),
             SleepFrame(sleep=0.5),
         ],
         stop_frame_timeout_s=0.5,
     )
 
-    reply_b, reply_c = [f.context_id for f in down if isinstance(f, TTSStartedFrame)][1:]
-    assert _audio_of(down, reply_b) == _pcm(2)
-    assert _audio_of(down, reply_c) == _pcm(3)
+    sends = ["flush" if m.get("flush") else m["text"] for m in fake.of_type("sendText")]
+    assert sends == ["Let me check.", "flush", "One moment.", "flush", "Reply B.", "flush"]
+    _, speech, reply_b = [f.context_id for f in down if isinstance(f, TTSStartedFrame)]
+    assert _audio_of(down, speech) == _pcm(2)
+    assert _audio_of(down, reply_b) == _pcm(3)
+    stopped = [f.context_id for f in down if isinstance(f, TTSStoppedFrame)]
+    assert speech in stopped and reply_b in stopped
 
 
 @pytest.mark.asyncio
@@ -465,12 +468,16 @@ async def test_kalpa_tts_failed_replies_do_not_count_as_failing_connections():
 
 
 @pytest.mark.asyncio
-async def test_kalpa_tts_dropped_uninterruptible_speech_does_not_hold_the_next_reply():
-    """The barge-in also drops uninterruptible speech queued behind the reply; its context closes at once."""
+@pytest.mark.parametrize("reply_ended", [False, True], ids=["held", "queued-on-kalpa"])
+async def test_kalpa_tts_uninterruptible_speech_survives_a_barge_in(reply_ended):
+    """A barge-in cancels the reply, and uninterruptible speech behind it still plays.
+
+    Whether it was held behind the reply or already queued on Kalpa, where the cancel drops it,
+    the speech goes out after the cancel and before the next reply.
+    """
     fake = _FakeKalpa(render_seconds=0.5)
     speech = TTSSpeakFrame("Please hold.")
     speech.interruptible = False
-    start = time.monotonic()
     _, down, up = await _run_ws(
         fake,
         [
@@ -478,18 +485,29 @@ async def test_kalpa_tts_dropped_uninterruptible_speech_does_not_hold_the_next_r
             LLMTextFrame("First part of the reply."),
             SleepFrame(sleep=0.05),
             speech,
+            *([LLMFullResponseEndFrame()] if reply_ended else []),
             SleepFrame(sleep=0.1),
             InterruptionFrame(),
             *_reply("Sure."),
-            SleepFrame(sleep=1),
+            SleepFrame(sleep=2.5),
         ],
     )
 
-    assert len(fake.paths) == 1 and len(fake.of_type("cancelResponse")) == 1
-    assert "Please hold." not in [m.get("text") for m in fake.of_type("sendText")]
-    reply_b = [f.context_id for f in down if isinstance(f, TTSStartedFrame)][-1]
-    assert _audio_of(down, reply_b)
-    assert time.monotonic() - start < 5
+    assert not _errors(down + up)
+    assert len(fake.paths) == 1
+    types = [m["type"] for m in fake.messages]
+    assert types.count("cancelResponse") == 1
+    after = fake.messages[types.index("cancelResponse") + 1 :]
+    assert ["flush" if m.get("flush") else m["text"] for m in after] == [
+        "Please hold.",
+        "flush",
+        "Sure.",
+        "flush",
+    ]
+    reply, held, reply_b = [f.context_id for f in down if isinstance(f, TTSStartedFrame)]
+    assert _audio_of(down, reply) == b""
+    assert _audio_of(down, held) == _pcm(2)
+    assert _audio_of(down, reply_b) == _pcm(3)
 
 
 @pytest.mark.asyncio
